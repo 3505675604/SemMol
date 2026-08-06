@@ -177,7 +177,7 @@ bash scripts/finetune/run_finetune.sh configs/finetune/bace.yaml
 
 ## Hyperparameter Grid Search
 
-The entry point is `scripts/hyperparam/run_grid_search.py`, which supports both grid and random search strategies across pretraining and finetuning stages. Each trial runs as an independent subprocess, automatically capturing OOM, timeout, and metrics.
+The entry point is `scripts/hyperparam/run_grid_search.py`, which supports both grid and random search strategies across pretraining and finetuning stages. 
 
 ### Predefined Grid Definitions (`configs/hyperparam/`)
 
@@ -216,3 +216,25 @@ Each trial generates an isolated directory under `outputs/hyperparam/<name>/tria
 | `report.md` | Ranked table + sensitivity scores + best config |
 | `sensitivity.csv` | mean/std/sensitivity_score per parameter value |
 | `best_config.yaml` | YAML snippet of the best trial, diffable against the base config |
+
+
+📈 Reproducibility
+-Fixed random seeds for all experiments
+-Centralized configuration management
+-Modular and extensible codebase for easy customization
+
+📚 Citation
+If you use SemMol in your research, please cite the original authors:
+```bash
+@article{semmol,
+  title={SemMol:Semantic-level multimodal molecular learning inspired by biological concept formation via soft matching},
+  author={Anonymous},
+  journal={arXiv preprint},
+  year={202X}
+}
+```
+
+##License
+'''
+This project is licensed under the MIT License - see the LICENSE file for details.
+'''
