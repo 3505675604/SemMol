@@ -30,7 +30,7 @@ tokenizer:
   max_length: 256
 
 geometry:
-  num_conformers: 3
+  num_conformers: 4
   prune_rms_threshold: 0.5
   seed: 42
 
