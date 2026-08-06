@@ -1,0 +1,75 @@
+experiment:
+  name: "semmol_pretrain_3m"
+  mode: "pretrain"
+  seed: 3407
+  deterministic: true
+  cudnn_benchmark: false
+
+model:
+  encoders: configs/model/encoders.yaml
+  dcl: configs/model/dcl.yaml
+  acsm: configs/model/acsm.yaml
+  projection: configs/model/projection.yaml
+  pretraining_heads: configs/model/pretraining_heads.yaml
+  modalities: ["1d", "2d", "3d"]
+  anchor_modality: "1d"
+  freeze_encoders: false
+
+data:
+  store_dir: data/processed/pcqm/store
+  manifest_path: data/processed/pcqm/store/views/pcqm_3m.npz
+  tokenizer_dir: data/processed/pcqm/tokenizer
+  modalities: ["1d", "2d", "3d"]
+  strict_modalities: true
+  num_workers: 12
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+train:
+  batch_size: 256
+  epochs: 50                 
+  accum_steps: 1
+  grad_clip: 1.0
+  mixed_precision: "bf16"
+
+  optimizer:
+    type: adamw
+    lr: 7.5e-5               
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: cosine
+    warmup_ratio: 0.03
+    min_lr: 1.0e-6
+
+loss:
+  mlm: 1.0
+  graph: 1.0
+  geo: 0.5
+  pseudo: 0.1
+  alignment: 0.01
+
+mask:
+  smiles_ratio: 0.15
+  node_ratio: 0.15
+  edge_ratio: 0.15
+  geo_noise_std: 1.0
+
+distributed:
+  backend: nccl
+  world_size: 8
+  broadcast_buffers: false
+  sync_batchnorm: true
+  find_unused_parameters: true
+  sampler: distributed
+
+output:
+  checkpoint_dir: checkpoints/pretrain
+  log_dir: outputs/logs
+  save_every_n_epochs: 5
+  resume: null
+  log_interval: 100
+  tensorboard: true
+  wandb: false

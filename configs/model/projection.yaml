@@ -1,0 +1,27 @@
+input_dim: 512               
+output_dim: 256             
+projection_types:
+  1d: mlp
+  2d: mlp
+  3d: sap
+  qm: sap
+normalize_eps: 1.0e-8
+validate_values: false      
+
+mlp:
+  hidden_dim: 512
+  num_layers: 2
+  activation: gelu
+  dropout: 0.1
+  bias: true
+  layer_norm_eps: 1.0e-5
+
+sap:
+  hidden_dim: 512
+  num_heads: 8
+  num_semantic_tokens: 16
+  dropout: 0.1
+  feedforward_multiplier: 4
+  layer_norm_eps: 1.0e-5
+  learnable_temperature: true
+  temperature_init: 1.0

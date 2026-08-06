@@ -1,0 +1,68 @@
+
+shared_dim: 512
+
+smiles:  
+  tokenizer_dir: data/processed/pcqm/tokenizer
+  mode: pretrained_adapter
+  model_name_or_path: DeepChem/ChemBERTa-77M-MLM
+  native_tokenizer_name_or_path: DeepChem/ChemBERTa-77M-MLM
+  shared_dim: 512
+  pooling: cls
+  freeze_layers: 0
+  validate_values: false     
+  local_files_only: false
+  cache_dir: checkpoints/huggingface
+  revision: ed8a5374f2024ec8da53760af91a33fb8f6a15ff
+
+  scratch_hidden_size: 512
+  scratch_num_hidden_layers: 6
+  scratch_num_attention_heads: 8
+  scratch_intermediate_size: 2048
+  scratch_max_position_embeddings: 258
+  scratch_hidden_act: gelu
+  scratch_hidden_dropout_prob: 0.1
+  scratch_attention_probs_dropout_prob: 0.1
+  scratch_layer_norm_eps: 1.0e-12
+
+graph:  
+  encoder_type: gatedgcn     
+
+  node_feature_cardinalities: [120, 6, 13, 13, 11, 7, 7, 3, 3]
+  edge_feature_cardinalities: [6, 7, 3]
+  num_layers: 5
+  hidden_size: 512
+  dropout: 0.1
+  residual: true
+  layer_norm: true
+  train_eps: true
+  validate_values: false
+
+geo: 
+  hidden_size: 128
+  num_blocks: 6
+  num_bilinear: 8
+  num_spherical: 7
+  num_radial: 6
+  cutoff: 5.0                
+  envelope_exponent: 5
+  num_before_skip: 1
+  num_after_skip: 2
+  num_output_layers: 3
+  target_dim: 512            
+  dropout: 0.1
+  max_num_neighbors: 32
+  conformer_pooling: mean
+  validate_values: true
+
+qm:  
+  in_channels: 1            
+  grid_size: 32            
+  base_channels: 64
+  hidden_size: 512
+  num_res_blocks: 4
+  use_attention: true
+  dropout: 0.1
+  log1p_input: true
+  voxel_spacing: 0.75       
+  density_channel: 0
+  validate_values: false

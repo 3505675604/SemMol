@@ -1,0 +1,91 @@
+schema_version: 1
+
+source:
+  dataset_root: data/raw/PCQM4Mv2
+  source_manifest: data/processed/pcqm/source_manifest.parquet
+  official_sdf: data/raw/PCQM4Mv2/pcqm4m-v2-train.sdf
+  smiles_column: smiles
+  gap_column: homolumogap
+  source_index_column: source_index
+  split_column: official_split
+  required_split: train
+  parquet_chunk_size: 65536
+
+selection:
+  target_sizes: [1000000, 3000000]
+  gap_bins: 10
+  seed: 3407
+  canonical_isomeric: true
+  morgan_radius: 2
+  morgan_bits: 2048
+  mode: approximate
+  bucket_size: 1024
+  exact_threshold: 4096
+  exact_max_candidates: 20000
+  workers: 16
+  block_size: 100000
+  staging_dir: null
+  manifest_dir: data/processed/pcqm/manifests
+  current_path: data/processed/pcqm/manifests/pcqm_selection_CURRENT.json
+
+tokenizer:
+  output_dir: data/processed/pcqm/tokenizer
+  min_frequency: 50
+  max_merges: null
+  target_vocab_size: 8192
+  max_length: 256
+  corpus_chunk_size: 65536
+  special_tokens:
+    pad: "[PAD]"
+    unk: "[UNK]"
+    cls: "[CLS]"
+    sep: "[SEP]"
+    mask: "[MASK]"
+
+geometry:
+  output_dir: data/processed/pcqm/geometry
+  official_first: true
+  num_conformers: 3
+  prune_rms_threshold: 0.5
+  seed: 42
+  shard_size: 8192
+  workers: 1
+
+density:
+  method: promolecular_gaussian
+  grid_size: 32
+  spacing: 0.75
+  box_padding: 4.0
+  atomic_sigma: element
+  conformer_index: 0
+  discrete_normalize: true
+  strict_bounds: true
+  storage_dtype: float16
+
+storage:
+  output_dir: data/processed/pcqm/store
+  records_per_shard: 8192
+  lmdb_map_size_gib: 4
+  compression: zstd
+  compression_level: 3
+  commit_interval: 256
+  store_max_target: 3000000
+
+builder:
+  workers: 16
+  work_batch_size: 2048
+  max_open_geometry_shards: 8
+  verify_checksums: true
+
+failure_policy:
+  fail_on_unknown_exception: true
+  max_expected_failure_rate: 0.005
+  require_exact_target_size: true
+  failures_path: data/processed/pcqm/store/feature-failures.jsonl
+
+loader:
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  strict_modalities: true

@@ -1,0 +1,16 @@
+feature_dim: 256
+num_clusters: 32
+ema_momentum: 0.9
+
+init_method: kmeans_plus_plus
+init_num_iters: 5
+init_max_samples: 256
+init_seed: 42
+reassign_interval: 1
+assignment_temperature: 0.5
+center_l2_normalize: true
+distributed_sync: true
+warmup_steps: 0
+
+eps: 1.0e-8
+validate_values: false

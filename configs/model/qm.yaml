@@ -1,0 +1,20 @@
+
+grid:
+  size: 32                  
+  resolution: 0.75          
+  box_padding: 4.0          
+
+
+density:
+  method: "promolecular_gaussian"
+  atomic_sigma: "element"    
+  normalize: true          
+
+storage:
+  format: npz             
+  dtype: float32
+  compress: true
+
+encoder:
+  in_channels: 1
+  grid_size: 32            

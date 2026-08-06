@@ -1,0 +1,77 @@
+name: "Full SemMol Hyperparameter Search"
+description: >
+  DCL (K, β), ACSM (M, τ, δ), training (lr, weight_decay), mask ratios,
+  encoder dropout, and loss weights.  Intended for random search only.
+
+search_strategy: random
+
+axes:
+  - path: "model.dcl.num_clusters"
+    values: [4,8,16,32,64,128,256,384,512,768,1024]
+    value_type: int
+
+  - path: "model.dcl.ema_momentum"
+    values: [0.50,0.70,0.90,0.99,0.999]
+    value_type: float
+
+  - path: "model.acsm.num_retrieve"
+    values: [4,8,16,32,64,128,256,512]
+    value_type: int
+
+  - path: "model.acsm.temperature"
+    values: [0.03,0.05,0.07,0.10,0.15,0.20]
+    value_type: float
+
+  - path: "model.acsm.denoise_threshold"
+    values: [0.30,0.40,0.50,0.60,0.70]
+    value_type: float
+
+  - path: "train.optimizer.lr"
+    values: [1.0e-5, 5.0e-5, 1.0e-4, 3.0e-4, 5.0e-4]
+    value_type: float
+
+  - path: "train.optimizer.weight_decay"
+    values: [0.05,0.10,0.20, 0.1]
+    value_type: float
+
+  - path: "mask.smiles_ratio"
+    values: [0.10, 0.15, 0.20,0.50,1.00,2.00]
+    value_type: float
+
+  - path: "mask.node_ratio"
+    values: [0.10, 0.15, 0.20, 0.25,1.00,2.00]
+    value_type: float
+
+  - path: "mask.edge_ratio"
+    values: [0.10, 0.15, 0.20, 0.25,1.00,2.00]
+    value_type: float
+
+  - path: "mask.geo_noise_std"
+    values: [0.5, 1.0, 1.5, 2.0]
+    value_type: float
+
+  - path: "loss.mlm"
+    values: [0.5, 1.0]
+    value_type: float
+
+  - path: "loss.graph"
+    values: [0.5, 1.0]
+    value_type: float
+
+  - path: "loss.geo"
+    values: [0.1, 0.5, 1.0]
+    value_type: float
+
+constraints:
+  - expression: "model.acsm.num_retrieve < model.dcl.num_clusters"
+    message: "M must be less than K"
+
+evaluation:
+  mode: pretrain
+  fast_epochs: 10
+  metrics: ["train_loss"]
+  direction: minimize
+
+seed: 3407
+random_trials: 100
+max_trials: 100

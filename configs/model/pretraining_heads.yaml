@@ -1,0 +1,18 @@
+mlm:
+  enabled: true
+  bias: true
+  layer_norm_eps: 1.0e-5
+
+graph:
+  enabled: true
+  bias: true
+  layer_norm_eps: 1.0e-5
+
+geo:
+  enabled: true
+  hidden_dim: 128
+  num_radial: 16
+  cutoff: 5.0
+  max_num_neighbors: 32
+  layer_norm_eps: 1.0e-5
+  eps: 1.0e-8

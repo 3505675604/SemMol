@@ -1,0 +1,33 @@
+name: "ACSM Parameter Sensitivity"
+description: >
+  Sensitivity analysis of ACSM num_retrieve (M), temperature (τ),
+  and denoise_threshold (δ).  The soft matching mechanism is expected
+  to be robust to τ and M within their reasonable ranges.
+
+search_strategy: grid
+
+axes:
+  - path: "model.acsm.num_retrieve"
+    values: [4, 8, 16, 32]
+    value_type: int
+
+  - path: "model.acsm.temperature"
+    values: [0.03, 0.05, 0.07, 0.10, 0.15, 0.20]
+    value_type: float
+
+  - path: "model.acsm.denoise_threshold"
+    values: [0.3, 0.4, 0.5, 0.6, 0.7]
+    value_type: float
+
+constraints:
+  - expression: "model.acsm.num_retrieve < model.dcl.num_clusters"
+    message: "M (num_retrieve) must be less than K (num_clusters)"
+
+evaluation:
+  mode: pretrain
+  fast_epochs: 10
+  metrics: ["train_loss"]
+  direction: minimize
+
+seed: 3407
+max_trials: 120
