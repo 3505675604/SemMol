@@ -1,0 +1,247 @@
+"""Export a stable source manifest from the official OGB PCQM4Mv2 dataset object.
+
+This script does not renumber samples. ``source_index`` always equals the OGB
+Dataset global index; ``train_ordinal`` is the position in the training split,
+used to map the order of the official training SDF back to source indices. The
+output Parquet file can be used directly as input to ``filter_pcqm.py``.
+
+Server usage:
+    python scripts/preprocess/prepare_pcqm_manifest.py \
+        --dataset-root data/raw/PCQM4Mv2 \
+        --output data/processed/pcqm/source_manifest.parquet \
+        --chunk-size 65536
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.metadata
+import math
+import sys
+from pathlib import Path
+from typing import Any, Dict, Mapping, Sequence, Tuple
+
+import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.utils.io import atomic_output_path, atomic_write_json, sha256_file
+
+
+SPLIT_NAMES = ("train", "valid", "test-dev", "test-challenge")
+SPLIT_TO_CODE = {name: index for index, name in enumerate(SPLIT_NAMES)}
+
+
+def _as_index_array(values: Any, split_name: str) -> np.ndarray:
+    if hasattr(values, "detach"):
+        values = values.detach().cpu().numpy()
+    array = np.asarray(values, dtype=np.int64).reshape(-1)
+    if array.size and np.any(array < 0):
+        raise ValueError(f"split {split_name} contains negative indices")
+    return array
+
+
+def build_split_lookup(
+    dataset_size: int,
+    split_indices: Mapping[str, Any],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build deterministic source_index -> split-code/train-ordinal arrays."""
+
+    if dataset_size <= 0:
+        raise ValueError("dataset_size must be a positive integer")
+    missing = set(SPLIT_NAMES) - set(split_indices)
+    if missing:
+        raise ValueError(f"OGB split is missing fields: {sorted(missing)}")
+
+    split_lookup = np.full(dataset_size, -1, dtype=np.int8)
+    train_ordinal = np.full(dataset_size, -1, dtype=np.int64)
+    for split_name in SPLIT_NAMES:
+        indices = _as_index_array(split_indices[split_name], split_name)
+        if indices.size and int(indices.max()) >= dataset_size:
+            raise ValueError(
+                f"split {split_name} index {int(indices.max())} exceeds dataset size "
+                f"{dataset_size}"
+            )
+        if len(np.unique(indices)) != len(indices):
+            raise ValueError(f"split {split_name} contains duplicate indices")
+        occupied = split_lookup[indices] != -1
+        if np.any(occupied):
+            duplicate = indices[np.nonzero(occupied)[0][:10]].tolist()
+            raise ValueError(f"source_index appears in multiple splits: {duplicate}")
+        split_lookup[indices] = SPLIT_TO_CODE[split_name]
+        if split_name == "train":
+            train_ordinal[indices] = np.arange(len(indices), dtype=np.int64)
+
+    unassigned = np.nonzero(split_lookup == -1)[0]
+    if unassigned.size:
+        raise ValueError(
+            f"{len(unassigned)} source_index values are not assigned to a split; "
+            f"examples: {unassigned[:10].tolist()}"
+        )
+    return split_lookup, train_ordinal
+
+
+def normalize_pcqm_item(item: Any) -> Tuple[str, float]:
+    """Normalize one OGB only_smiles Dataset item to ``(smiles, gap)``."""
+
+    if not isinstance(item, Sequence) or isinstance(item, (str, bytes)) or len(item) != 2:
+        raise ValueError(f"PCQM item must be (smiles, gap), got {type(item)!r}")
+    smiles = str(item[0]).strip()
+    if not smiles:
+        raise ValueError("PCQM item has an empty SMILES")
+    try:
+        gap = float(item[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"PCQM item gap is not numeric: {item[1]!r}") from exc
+    # Per OGB convention, the test-split gap may be NaN and must be preserved in the source manifest.
+    if math.isinf(gap):
+        raise ValueError(f"PCQM item gap is infinite: {gap}")
+    return smiles, gap
+
+
+def _require_pyarrow():
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError(
+            "prepare_pcqm_manifest.py requires pyarrow; install it from the server environment file"
+        ) from exc
+    return pa, pq
+
+
+def export_pcqm_manifest(
+    dataset_root: Path,
+    output_path: Path,
+    *,
+    chunk_size: int,
+    compression: str = "zstd",
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    try:
+        # from ogb.lsc import PCQM4Mv2Dataset
+        from ogb.lsc.pcqm4m_pyg import PygPCQM4Mv2Dataset as PCQM4Mv2Dataset
+    except ImportError as exc:
+        raise RuntimeError("ogb is missing; install it from the server environment file") from exc
+
+    pa, pq = _require_pyarrow()
+    dataset = PCQM4Mv2Dataset(root=str(dataset_root), only_smiles=True)
+    dataset_size = len(dataset)
+    split_indices = dataset.get_idx_split()
+    split_lookup, train_ordinal = build_split_lookup(dataset_size, split_indices)
+    schema = pa.schema(
+        [
+            pa.field("source_index", pa.int64(), nullable=False),
+            pa.field("smiles", pa.string(), nullable=False),
+            pa.field("homolumogap", pa.float64(), nullable=True),
+            pa.field("official_split", pa.string(), nullable=False),
+            pa.field("train_ordinal", pa.int64(), nullable=False),
+        ]
+    )
+
+    output_path = output_path.resolve()
+    with atomic_output_path(output_path, overwrite=overwrite) as temporary_path:
+        writer = pq.ParquetWriter(
+            temporary_path,
+            schema=schema,
+            compression=compression,
+            use_dictionary=["official_split"],
+            write_statistics=True,
+        )
+        try:
+            for start in range(0, dataset_size, chunk_size):
+                end = min(start + chunk_size, dataset_size)
+                source_indices = np.arange(start, end, dtype=np.int64)
+                smiles_values = []
+                gap_values = []
+                for source_index in source_indices.tolist():
+                    try:
+                        smiles, gap = normalize_pcqm_item(dataset[source_index])
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Failed to read source_index={source_index}"
+                        ) from exc
+                    smiles_values.append(smiles)
+                    gap_values.append(gap)
+                split_values = [
+                    SPLIT_NAMES[int(code)]
+                    for code in split_lookup[start:end].tolist()
+                ]
+                table = pa.Table.from_arrays(
+                    [
+                        pa.array(source_indices, type=pa.int64()),
+                        pa.array(smiles_values, type=pa.string()),
+                        pa.array(gap_values, type=pa.float64(), from_pandas=True),
+                        pa.array(split_values, type=pa.string()),
+                        pa.array(train_ordinal[start:end], type=pa.int64()),
+                    ],
+                    schema=schema,
+                )
+                writer.write_table(table, row_group_size=len(table))
+        finally:
+            writer.close()
+
+    split_counts = {
+        split_name: int(np.sum(split_lookup == split_code))
+        for split_name, split_code in SPLIT_TO_CODE.items()
+    }
+    try:
+        ogb_version = importlib.metadata.version("ogb")
+    except importlib.metadata.PackageNotFoundError:
+        ogb_version = "unknown"
+    metadata = {
+        "schema_version": 1,
+        "dataset": "PCQM4Mv2",
+        "ogb_version": ogb_version,
+        "row_count": dataset_size,
+        "split_counts": split_counts,
+        "columns": [field.name for field in schema],
+        "parquet_sha256": sha256_file(output_path),
+    }
+    metadata_path = output_path.with_suffix(output_path.suffix + ".metadata.json")
+    atomic_write_json(metadata_path, metadata, overwrite=overwrite)
+    return metadata
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Export an OGB PCQM4Mv2 source-index, split, SMILES, and gap manifest"
+    )
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=Path("data/raw/PCQM4Mv2"),
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/processed/pcqm/source_manifest.parquet"),
+    )
+    parser.add_argument("--chunk-size", type=int, default=65_536)
+    parser.add_argument("--compression", choices=("zstd", "snappy", "none"), default="zstd")
+    parser.add_argument("--overwrite", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    compression = None if args.compression == "none" else args.compression
+    metadata = export_pcqm_manifest(
+        args.dataset_root,
+        args.output,
+        chunk_size=args.chunk_size,
+        compression=compression,
+        overwrite=args.overwrite,
+    )
+    print(
+        f"[PCQM source] complete: rows={metadata['row_count']} "
+        f"sha256={metadata['parquet_sha256']}"
+    )
+
+
+if __name__ == "__main__":
+    main()
