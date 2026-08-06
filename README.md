@@ -142,6 +142,36 @@ for dataset in bace bbbp clintox tox21 toxcast sider freesolv esol lipophilicity
     --store-dir "data/processed/moleculenet/${dataset}" --full
 done
 ```
+## 📦 Data Availability & Pre-trained Model Checkpoints
+
+To ensure the full reproducibility of our study, we provide public access to all pre-training dataset index files, data split files, and pre-trained model weights (checkpoints).
+
+### 1. Data Availability & Dataset Indices
+
+The raw pre-training dataset ([PCQM4Mv2](https://ogb.stanford.edu/docs/lsc/pcqm4mv2/)) and the downstream evaluation benchmarks ([MoleculeNet](https://moleculenet.org/)) are sourced from their official public repositories.
+
+To precisely reproduce our pre-training datasets, we provide the index files and dataset splits generated via our stratified sampling protocol:
+* **Core Pre-training Subsets**: Index files for the 1M (1 million molecules) and 3M (3 million molecules) pre-training subsets.
+
+📥 **Download Dataset Indices & Split Files**: [https://huggingface.co/Lin-Glory/1Mv3M-indices](https://huggingface.co/Lin-Glory/1Mv3M-indices)
+
+---
+
+### 2. Pre-trained Model Weights (Checkpoints)
+
+| Model Category | Checkpoint Name | Description |
+| :--- | :--- | :--- |
+| **Main Models** | `SemMol-1M` | Main model pre-trained on the 1M molecular subset [[Link]](https://huggingface.co/Lin-Glory/SemMol-0.1M-0.3M-0.5M-0.7M-1M-3M-PCQM4V2) |
+| | `SemMol-3M` | Main model pre-trained on the 3M molecular subset [[Link]](https://huggingface.co/Lin-Glory/SemMol-0.1M-0.3M-0.5M-0.7M-1M-3M-PCQM4V2) |
+| **Anchor Modality Variants (1M Scale)** | `2D-anchor1M` | 1M scale model using 2D Graph as Anchor [[Link]](https://huggingface.co/Lin-Glory/2D-3D-anchor1M) |
+| | `3D-anchor1M` | 1M scale model using 3D Geometry as Anchor [[Link]](https://huggingface.co/Lin-Glory/2D-3D-anchor1M) |
+| **Anchor Modality Variants (3M Scale)** | `2D-anchor3M` | 3M scale model using 2D Graph as Anchor [[Link]](https://huggingface.co/Lin-Glory/2D-3D-anchor3M) |
+| | `3D-anchor3M` | 3M scale model using 3D Geometry as Anchor [[Link]](https://huggingface.co/Lin-Glory/2D-3D-anchor3M) |
+| **Multi-Conformer Extensions** | `SemMol+Multi-3D` | Model incorporating multi-conformer 3D spatial representations [[Link]](https://huggingface.co/Lin-Glory/SemMol-Multi-3D-1M) |
+| | `SemMol-1M+Multi-3D` | 1M pre-trained model incorporating multi-conformer 3D spatial representations [[Link]](https://huggingface.co/Lin-Glory/SemMol-Multi-3D-1M) |
+| **Quantum Mechanics (QM) Extensions** | `SemMol-QM` | Model incorporating Quantum Mechanics (QM) electronic density representations [[Link]](https://huggingface.co/Lin-Glory/SemMol-QM) |
+| | `SemMol-3D-QM` | Model jointly fusing 3D geometry and QM electronic representations [[Link]](https://huggingface.co/Lin-Glory/SemMol-3D-QM) |
+
 
 ## Training Configuration & Launch
 Single-node 8-GPU (the script defaults to `NNODES=1` and derives 8 processes per node from the YAML `world_size=8`):
