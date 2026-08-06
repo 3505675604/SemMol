@@ -1,3 +1,27 @@
+# Semantic-level multimodal molecular learning inspired by biological concept formation via soft matching
+
+Fig. 1 | From instance-level to semantic-level alignment in multimodal molecular representation learning. 
+a, Instance-level (left) and semantic-level (right) alignment paradigm. b, An example of human perception, where the simultaneous presence of bread, meat, and vegetables naturally leads to the recognition of a hamburger (left); an illustration of the proposed semantic-level soft matching mechanism for molecular understanding (right). c, Classification performance comparison across multiple benchmark datasets for representative molecular representation models.
+![WPS图片(1)](https://github.com/user-attachments/assets/eec1ebf2-230a-4315-9b4d-dcf797eb9de6)
+Fig. 2 | Conceptual framework of the semantic-level multimodal molecular representation learning of SemMol. 
+a, DCL construction. Initial semantic centers for 2D and 3D modalities are constructed from 1D, 2D, and 3D representations via intra-batch clustering and refined using mini-batch K-means with Exponential Moving Average (EMA) updates in the DCL. b, ACSM mechanism. b1, Positive sample generation: retrieve the nearest semantic centers from 2D/3D center libraries relative to the anchor and construct positive samples using similarity-weighted fusion. b2, Negative sample generation and debiasing: filter out easily distinguishable negatives using a similarity threshold while retaining hard negatives to improve discriminative ability. c, Semantic alignment training by using the constructed positive and negative samples.
+<img width="1493" height="1310" alt="图片1" src="https://github.com/user-attachments/assets/1152bc6a-7c20-4239-8d26-ef0139749594" />
+
+
+##
+The most important supplementary file is provided at the following link: https://github.com/3505675604/SemMol/blob/main/Supplementary_Materials/Supplementary%20Materials.pdf
+
+## 🚀 Features
+- Semantic-level learning: By introducing the anchor-center soft matching (ACSM) mechanism and the dynamic center library (DCL), cross-modal semantic alignment is achieved, avoiding the risk of overfitting caused by one-to-one instance matching. This method can simultaneously capture the global skeleton structure and local functional group characteristics of the molecule, improving the model's generalization ability and interpretability.
+- **Multi-Modal Learning**: Integrates chemical structure, text, and other modalities for improved prediction.
+- **Flexible Task Support**: Handles both classification and regression tasks with dynamic configuration.
+- **Advanced Pseudo-Pair Generation**: Supports hard negative mining, adaptive temperature, and memory bank for contrastive learning.
+- **Streaming & Incremental Clustering**: Online center library with streaming K-means and FAISS acceleration.
+- **Configurable & Reproducible**: All settings managed via a single JSON config; supports experiment reproducibility.
+- **Extensible Architecture**: Modular codebase for easy extension of models, data pipelines, and loss functions.
+- **Pretrained Model Integration**: Easy download and usage of state-of-the-art pretrained models.
+
+---
 ## Environment Setup
 
 ```bash
@@ -164,7 +188,7 @@ The entry point is `scripts/hyperparam/run_grid_search.py`, which supports both 
 | `training_sensitivity.yaml` | lr, weight_decay, loss weights | grid |
 | `mask_encoder_sensitivity.yaml` | Per-modality mask ratios, geo noise, dropout | grid |
 | `finetune_sensitivity.yaml` | Finetuning lr, weight_decay, batch_size, warmup | grid |
-| `full_grid.yaml` | All 14 dimensions jointly | random |
+
 
 Core fields of a grid definition: `axes` (`path` is a dotted YAML key, `values` is the list of candidate values), `constraints` (expressions like `"M < K"` to filter invalid combinations), and `evaluation` (`mode`, `fast_epochs`, `metrics`, `direction`).
 
