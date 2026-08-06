@@ -45,7 +45,7 @@ tokenizer:
 geometry:
   output_dir: data/processed/pcqm/geometry
   official_first: true
-  num_conformers: 3
+  num_conformers: 4
   prune_rms_threshold: 0.5
   seed: 42
   shard_size: 8192
