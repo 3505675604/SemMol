@@ -168,9 +168,7 @@ To precisely reproduce our pre-training datasets, we provide the index files and
 | **Anchor Modality Variants (3M Scale)** | `2D-anchor3M` | 3M scale model using 2D Graph as Anchor [[Link]](https://huggingface.co/Lin-Glory/2D-3D-anchor3M) |
 | | `3D-anchor3M` | 3M scale model using 3D Geometry as Anchor [[Link]](https://huggingface.co/Lin-Glory/2D-3D-anchor3M) |
 | **Multi-Conformer Extensions** | `SemMol+Multi-3D` | Model incorporating multi-conformer 3D spatial representations [[Link]](https://huggingface.co/Lin-Glory/SemMol-Multi-3D-1M) |
-| | `SemMol-1M+Multi-3D` | 1M pre-trained model incorporating multi-conformer 3D spatial representations [[Link]](https://huggingface.co/Lin-Glory/SemMol-Multi-3D-1M) |
-| **Quantum Mechanics (QM) Extensions** | `SemMol-QM` | Model incorporating Quantum Mechanics (QM) electronic density representations [[Link]](https://huggingface.co/Lin-Glory/SemMol-QM) |
-| | `SemMol-3D-QM` | Model jointly fusing 3D geometry and QM electronic representations [[Link]](https://huggingface.co/Lin-Glory/SemMol-3D-QM) |
+
 
 
 ## Training Configuration & Launch
