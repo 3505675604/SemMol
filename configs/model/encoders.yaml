@@ -3,9 +3,9 @@ shared_dim: 512
 
 smiles:  
   tokenizer_dir: data/processed/pcqm/tokenizer
-  mode: pretrained_adapter
-  model_name_or_path: DeepChem/ChemBERTa-77M-MLM
-  native_tokenizer_name_or_path: DeepChem/ChemBERTa-77M-MLM
+  mode: scratch
+  model_name_or_path: null
+  native_tokenizer_name_or_path: null
   shared_dim: 512
   pooling: cls
   freeze_layers: 0
@@ -14,10 +14,10 @@ smiles:
   cache_dir: checkpoints/huggingface
   revision: ed8a5374f2024ec8da53760af91a33fb8f6a15ff
 
-  scratch_hidden_size: 512
-  scratch_num_hidden_layers: 6
-  scratch_num_attention_heads: 8
-  scratch_intermediate_size: 2048
+  scratch_hidden_size: 768
+  scratch_num_hidden_layers: 12
+  scratch_num_attention_heads: 12
+  scratch_intermediate_size: 3072
   scratch_max_position_embeddings: 258
   scratch_hidden_act: gelu
   scratch_hidden_dropout_prob: 0.1
@@ -25,7 +25,8 @@ smiles:
   scratch_layer_norm_eps: 1.0e-12
 
 graph:  
-  encoder_type: gatedgcn     
+  encoder_type: grover     
+  num_heads: 8
 
   node_feature_cardinalities: [120, 6, 13, 13, 11, 7, 7, 3, 3]
   edge_feature_cardinalities: [6, 7, 3]
