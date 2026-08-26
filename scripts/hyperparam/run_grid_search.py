@@ -23,6 +23,7 @@ import itertools
 import json
 import math
 import random
+import statistics
 import subprocess
 import sys
 import time
@@ -30,6 +31,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import yaml
 
 # Support both relative imports (when run as a package) and absolute imports
@@ -86,7 +88,7 @@ _GRID_SCHEMA_KEYS = frozenset(
 )
 _AXIS_SCHEMA_KEYS = frozenset({"path", "values", "value_type"})
 _EVALUATION_SCHEMA_KEYS = frozenset(
-    {"mode", "fast_epochs", "metrics", "direction"}
+    {"mode", "fast_epochs", "cv_folds", "metrics", "direction"}
 )
 _DIRECTION_ALIASES = {
     "min": "minimize", "minimize": "minimize",
@@ -440,6 +442,7 @@ def _parse_grid_definition(path: Path) -> GridDefinition:
 
     mode = str(evaluation.get("mode", "pretrain"))
     fast_epochs = int(evaluation.get("fast_epochs", 10))
+    cv_folds = int(evaluation.get("cv_folds", 1))
     metrics = tuple(
         str(m)
         for m in evaluation.get("metrics", ["train_loss"])
@@ -454,6 +457,7 @@ def _parse_grid_definition(path: Path) -> GridDefinition:
         constraints=tuple(constraints),
         evaluation_mode=mode,
         fast_epochs=fast_epochs,
+        cv_folds=cv_folds,
         metrics=metrics,
         direction=direction,
         seed=int(raw.get("seed", 3407)),
@@ -574,6 +578,292 @@ def _write_results_json(results: list[TrialResult], path: Path) -> None:
         json.dump(serializable, handle, indent=2, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# K-fold cross-validation support
+# ---------------------------------------------------------------------------
+
+
+def _resolve_project_path(value: str | Path, project_root: Path) -> Path:
+    """Resolve a config path against the SemMol project root when relative."""
+    path = Path(value)
+    if not path.is_absolute():
+        path = project_root / path
+    return path.resolve()
+
+
+def _load_manifest_npz(
+    path: Path,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read an NPZ manifest containing ``record_index`` and ``source_index``."""
+    with np.load(path, allow_pickle=False) as archive:
+        missing = {"record_index", "source_index"} - set(archive.files)
+        if missing:
+            raise ValueError(
+                f"manifest {path} is missing fields: {sorted(missing)}"
+            )
+        record_index = np.asarray(archive["record_index"], dtype=np.int64)
+        source_index = np.asarray(archive["source_index"], dtype=np.int64)
+        if record_index.ndim != 1 or source_index.ndim != 1:
+            raise ValueError(
+                f"manifest {path} must contain 1D record_index/source_index"
+            )
+        if len(record_index) != len(source_index):
+            raise ValueError(
+                f"manifest {path} record_index/source_index length mismatch"
+            )
+    return record_index, source_index
+
+
+def _write_manifest_npz(
+    path: Path,
+    record_index: np.ndarray,
+    source_index: np.ndarray,
+) -> Path:
+    """Write an NPZ manifest in the same format used by processed stores."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        record_index=np.asarray(record_index, dtype=np.int64),
+        source_index=np.asarray(source_index, dtype=np.int64),
+    )
+    return path.resolve()
+
+
+def _build_kfold_manifests(
+    train_manifest: str | Path,
+    valid_manifest: str | Path,
+    output_dir: Path,
+    *,
+    n_folds: int,
+    seed: int,
+    project_root: Path,
+) -> list[tuple[Path, Path]]:
+    """Build deterministic K-fold train/valid NPZ manifests from train+valid.
+
+    The original test manifest is intentionally left untouched so that the
+    final held-out test set remains independent of hyperparameter selection.
+    """
+    train_path = _resolve_project_path(train_manifest, project_root)
+    valid_path = _resolve_project_path(valid_manifest, project_root)
+
+    train_record, train_source = _load_manifest_npz(train_path)
+    valid_record, valid_source = _load_manifest_npz(valid_path)
+
+    record_index = np.concatenate([train_record, valid_record])
+    source_index = np.concatenate([train_source, valid_source])
+
+    if n_folds > len(record_index):
+        raise ValueError(
+            f"cannot create {n_folds} folds from only {len(record_index)} "
+            "train+validation samples"
+        )
+
+    rng = np.random.RandomState(seed)
+    permutation = rng.permutation(len(record_index))
+    record_index = record_index[permutation]
+    source_index = source_index[permutation]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    folds: list[tuple[Path, Path]] = []
+    fold_size = len(record_index) // n_folds
+    for fold_idx in range(n_folds):
+        start = fold_idx * fold_size
+        end = (
+            len(record_index)
+            if fold_idx == n_folds - 1
+            else start + fold_size
+        )
+        validation_mask = np.zeros(len(record_index), dtype=bool)
+        validation_mask[start:end] = True
+
+        train_path = output_dir / f"fold_{fold_idx:02d}_train.npz"
+        valid_path = output_dir / f"fold_{fold_idx:02d}_valid.npz"
+        _write_manifest_npz(
+            train_path,
+            record_index[~validation_mask],
+            source_index[~validation_mask],
+        )
+        _write_manifest_npz(
+            valid_path,
+            record_index[validation_mask],
+            source_index[validation_mask],
+        )
+        folds.append((train_path, valid_path))
+
+    return folds
+
+
+def _aggregate_fold_metrics(
+    fold_metrics: list[dict[str, float]],
+    primary_metric: str,
+) -> dict[str, float]:
+    """Average fold metrics and add a standard-deviation suffix."""
+    if not fold_metrics:
+        return {}
+    all_keys: set[str] = set()
+    for metrics in fold_metrics:
+        all_keys.update(metrics)
+    aggregated: dict[str, float] = {}
+    for key in sorted(all_keys):
+        values = [
+            float(metrics[key])
+            for metrics in fold_metrics
+            if key in metrics
+        ]
+        if not values:
+            continue
+        aggregated[key] = float(statistics.mean(values))
+        if key == primary_metric and len(values) > 1:
+            aggregated[f"{key}_std"] = float(statistics.stdev(values))
+    return aggregated
+
+
+def _run_cv_trial(
+    trial_spec: TrialSpec,
+    *,
+    base_config: dict[str, Any],
+    project_root: Path,
+    device: str | None,
+    timeout_per_trial: int,
+    trial_script: Path | None,
+    n_folds: int,
+    seed: int,
+    primary_metric: str,
+) -> TrialResult:
+    """Run one hyperparameter trial with K-fold cross-validation.
+
+    Each fold is executed as an independent ``run_finetune.py`` subprocess.
+    The final trial metric is the mean over validation folds, which is what
+    hyperparameter selection should use.
+    """
+    start = time.monotonic()
+    data_config = base_config.get("data")
+    if not isinstance(data_config, Mapping) or not all(
+        key in data_config
+        for key in ("train_manifest", "valid_manifest", "test_manifest")
+    ):
+        return TrialResult(
+            trial_index=trial_spec.trial_index,
+            grid_values=trial_spec.overrides,
+            status="error",
+            metrics={},
+            best_epoch=None,
+            wall_time_seconds=time.monotonic() - start,
+            error_message="CV mode requires data.train_manifest, "
+                          "data.valid_manifest, and data.test_manifest",
+            config_path=trial_spec.config_path,
+            output_dir=trial_spec.output_dir,
+        )
+
+    try:
+        folds = _build_kfold_manifests(
+            data_config["train_manifest"],
+            data_config["valid_manifest"],
+            trial_spec.output_dir / "cv",
+            n_folds=n_folds,
+            seed=seed,
+            project_root=project_root,
+        )
+        test_manifest = str(
+            _resolve_project_path(data_config["test_manifest"], project_root)
+        )
+    except Exception as exc:
+        return TrialResult(
+            trial_index=trial_spec.trial_index,
+            grid_values=trial_spec.overrides,
+            status="error",
+            metrics={},
+            best_epoch=None,
+            wall_time_seconds=time.monotonic() - start,
+            error_message=f"failed to build K-fold manifests: {exc}",
+            config_path=trial_spec.config_path,
+            output_dir=trial_spec.output_dir,
+        )
+
+    fold_metrics: list[dict[str, float]] = []
+    fold_errors: list[str] = []
+    fold_statuses: list[str] = []
+
+    for fold_idx, (train_path, valid_path) in enumerate(folds):
+        fold_output_dir = trial_spec.output_dir / f"fold_{fold_idx:02d}"
+        fold_config_path = fold_output_dir / "config.yaml"
+
+        config = _load_yaml(trial_spec.config_path, name="trial config")
+        data = config.setdefault("data", {})
+        data["train_manifest"] = str(train_path)
+        data["valid_manifest"] = str(valid_path)
+        data["test_manifest"] = test_manifest
+        data["allow_unregistered_views"] = True
+
+        output = config.setdefault("output", {})
+        if not isinstance(output, Mapping):
+            raise TypeError("trial config output section must be a mapping")
+        output["checkpoint_dir"] = str(fold_output_dir / "checkpoints")
+        output["log_dir"] = str(fold_output_dir / "logs")
+        output["tensorboard"] = False
+        output["wandb"] = False
+
+        fold_output_dir.mkdir(parents=True, exist_ok=True)
+        with fold_config_path.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(
+                config,
+                handle,
+                default_flow_style=False,
+                sort_keys=False,
+            )
+
+        try:
+            run = launch_trial(
+                config_path=fold_config_path,
+                output_dir=fold_output_dir,
+                mode="finetune",
+                project_root=project_root,
+                device=device,
+                timeout=timeout_per_trial,
+                trial_script=trial_script,
+            )
+        except Exception as exc:
+            fold_statuses.append("error")
+            fold_errors.append(f"fold {fold_idx}: {exc}")
+            continue
+        fold_statuses.append(run.status)
+        if run.status == "completed":
+            fold_metrics.append(run.metrics)
+        else:
+            fold_errors.append(
+                f"fold {fold_idx}: {run.status} {run.error_message or ''}"
+            )
+
+    elapsed = time.monotonic() - start
+    if fold_errors:
+        return TrialResult(
+            trial_index=trial_spec.trial_index,
+            grid_values=trial_spec.overrides,
+            status="failed" if not any(
+                status == "oom" for status in fold_statuses
+            ) else "oom",
+            metrics={},
+            best_epoch=None,
+            wall_time_seconds=elapsed,
+            error_message="; ".join(fold_errors),
+            config_path=trial_spec.config_path,
+            output_dir=trial_spec.output_dir,
+        )
+
+    metrics = _aggregate_fold_metrics(fold_metrics, primary_metric)
+    return TrialResult(
+        trial_index=trial_spec.trial_index,
+        grid_values=trial_spec.overrides,
+        status="completed",
+        metrics=metrics,
+        best_epoch=None,
+        wall_time_seconds=elapsed,
+        error_message=None,
+        config_path=trial_spec.config_path,
+        output_dir=trial_spec.output_dir,
+    )
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="SemMol hyperparameter grid search",
@@ -610,6 +900,15 @@ def _argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Number of fast evaluation epochs (overrides grid definition).",
+    )
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=None,
+        help=(
+            "Number of cross-validation folds for finetune hyperparameter "
+            "search (overrides grid definition; default is 1 = no CV)."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -661,6 +960,10 @@ def main(argv: list[str] | None = None) -> int:
         object.__setattr__(grid, "max_trials", args.max_trials)
     if args.epochs is not None:
         object.__setattr__(grid, "fast_epochs", args.epochs)
+    if args.cv_folds is not None:
+        if args.cv_folds < 1:
+            parser.error("--cv-folds must be at least 1")
+        object.__setattr__(grid, "cv_folds", args.cv_folds)
 
     if grid.evaluation_mode != args.mode:
         print(
@@ -668,6 +971,9 @@ def main(argv: list[str] | None = None) -> int:
             f"but --mode is '{args.mode}'; using grid setting"
         )
         args.mode = grid.evaluation_mode
+
+    if grid.cv_folds > 1 and args.mode != "finetune":
+        parser.error("--cv-folds / evaluation.cv_folds > 1 requires --mode finetune")
 
     output_dir = Path(args.output_dir).expanduser()
     if not output_dir.is_absolute():
@@ -738,14 +1044,27 @@ def main(argv: list[str] | None = None) -> int:
             )
             continue
 
-        result = _run_trial(
-            spec,
-            mode=args.mode,
-            project_root=project_root,
-            device=args.device,
-            timeout_per_trial=args.timeout_per_trial,
-            trial_script=trial_script,
-        )
+        if grid.cv_folds > 1:
+            result = _run_cv_trial(
+                spec,
+                base_config=base_config,
+                project_root=project_root,
+                device=args.device,
+                timeout_per_trial=args.timeout_per_trial,
+                trial_script=trial_script,
+                n_folds=grid.cv_folds,
+                seed=grid.seed,
+                primary_metric=grid.metrics[0],
+            )
+        else:
+            result = _run_trial(
+                spec,
+                mode=args.mode,
+                project_root=project_root,
+                device=args.device,
+                timeout_per_trial=args.timeout_per_trial,
+                trial_script=trial_script,
+            )
 
         results.append(result)
 
@@ -772,7 +1091,11 @@ def main(argv: list[str] | None = None) -> int:
     completed = [r for r in results if r.status == "completed"]
     if completed:
         ranked = rank_results(completed, grid.direction, grid.metrics[0])
-        sensitivity_scores = compute_sensitivity_scores(completed, grid.axes)
+        sensitivity_scores = compute_sensitivity_scores(
+            completed,
+            grid.axes,
+            grid.metrics[0],
+        )
         report = SensitivityReport(
             grid_name=grid.name,
             grid_description=grid.description,
