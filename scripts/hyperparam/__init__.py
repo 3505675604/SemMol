@@ -46,6 +46,7 @@ class GridDefinition:
     constraints: tuple[dict[str, str], ...] = ()
     evaluation_mode: str = "pretrain"
     fast_epochs: int = 10
+    cv_folds: int = 1
     metrics: tuple[str, ...] = ("train_loss",)
     direction: str = "minimize"
     seed: int = 3407
@@ -63,6 +64,8 @@ class GridDefinition:
             )
         if self.fast_epochs < 1:
             raise ValueError("fast_epochs must be at least 1")
+        if self.cv_folds < 1:
+            raise ValueError("cv_folds must be at least 1")
         _DIRECTION_ALIASES = {
             "min": "minimize", "minimize": "minimize",
             "max": "maximize", "maximize": "maximize",
