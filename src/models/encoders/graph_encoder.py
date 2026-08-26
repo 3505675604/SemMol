@@ -1,4 +1,4 @@
-"""Sparse edge-aware encoders for OGB categorical molecular graphs."""
+"""Sparse edge-aware GatedGCN, GINE, and GROVER-style graph encoders."""
 
 from __future__ import annotations
 
@@ -387,6 +387,132 @@ class GINELayer(nn.Module):
         return node_output, edge_output
 
 
+class GroverLayer(nn.Module):
+    """A lightweight GROVER-style message-passing transformer layer.
+
+    This is a from-scratch graph transformer that uses multi-head attention
+    over molecular edges and jointly updates node and edge embeddings.  It is
+    intentionally self-contained so that the 2D encoder can be trained from
+    scratch without loading external GROVER checkpoints, matching the
+    manuscript's "all encoders randomly initialized and optimized from
+    scratch" description.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        num_heads: int = 8,
+        dropout: float,
+        residual: bool,
+        layer_norm: bool,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = _positive_integer(hidden_size, "hidden_size")
+        self.residual = _require_boolean(residual, "residual")
+        use_layer_norm = _require_boolean(layer_norm, "layer_norm")
+        self.num_heads = _positive_integer(num_heads, "num_heads")
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError(
+                f"hidden_size ({self.hidden_size}) must be divisible by "
+                f"num_heads ({self.num_heads})"
+            )
+        self.head_dim = self.hidden_size // self.num_heads
+        dropout_probability = _dropout_probability(dropout)
+
+        self.query = nn.Linear(self.hidden_size, self.hidden_size)
+        self.key = nn.Linear(self.hidden_size, self.hidden_size)
+        self.value = nn.Linear(self.hidden_size, self.hidden_size)
+        self.edge_bias = nn.Linear(self.hidden_size, self.num_heads)
+        self.edge_self = nn.Linear(self.hidden_size, self.hidden_size)
+        self.edge_source = nn.Linear(
+            self.hidden_size, self.hidden_size, bias=False
+        )
+        self.edge_target = nn.Linear(
+            self.hidden_size, self.hidden_size, bias=False
+        )
+        self.node_ffn = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size * 2),
+            nn.SiLU(),
+            nn.Linear(self.hidden_size * 2, self.hidden_size),
+        )
+        self.output_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.node_attn_norm = (
+            nn.LayerNorm(self.hidden_size) if use_layer_norm else nn.Identity()
+        )
+        self.node_ffn_norm = (
+            nn.LayerNorm(self.hidden_size) if use_layer_norm else nn.Identity()
+        )
+        self.edge_norm = (
+            nn.LayerNorm(self.hidden_size) if use_layer_norm else nn.Identity()
+        )
+        self.node_attn_dropout = nn.Dropout(dropout_probability)
+        self.node_ffn_dropout = nn.Dropout(dropout_probability)
+        self.edge_dropout = nn.Dropout(dropout_probability)
+        self.apply(_reset_linear)
+
+    def forward(
+        self,
+        node_embedding: Tensor,
+        edge_embedding: Tensor,
+        edge_index: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        source, target = edge_index
+        node_count = int(node_embedding.shape[0])
+
+        # Edge features conditioned on source/target node states.
+        edge_candidate = F.silu(
+            self.edge_self(edge_embedding)
+            + self.edge_source(node_embedding[source])
+            + self.edge_target(node_embedding[target])
+        )
+        edge_update = self.edge_dropout(edge_candidate)
+        if self.residual:
+            edge_update = edge_embedding + edge_update
+        edge_output = self.edge_norm(edge_update)
+
+        # Multi-head attention over directed edges.
+        query = self.query(node_embedding[source]).view(
+            -1, self.num_heads, self.head_dim
+        )
+        key = self.key(node_embedding[target]).view(
+            -1, self.num_heads, self.head_dim
+        )
+        value = self.value(node_embedding[source]).view(
+            -1, self.num_heads, self.head_dim
+        )
+        scores = (query * key).sum(dim=-1) / (self.head_dim ** 0.5)
+        scores = scores + self.edge_bias(edge_output)
+        if node_count == 0:
+            attention = scores
+        else:
+            attention = segment_softmax(
+                scores,
+                target,
+                num_nodes=node_count,
+            )
+        messages = value * attention.unsqueeze(-1)
+        attention_output = _scatter_sum(
+            messages.reshape(-1, self.hidden_size),
+            target.repeat_interleave(self.num_heads),
+            node_count,
+        )
+        attention_output = self.output_proj(attention_output)
+        if self.residual:
+            node_update = node_embedding + self.node_attn_dropout(attention_output)
+        else:
+            node_update = self.node_attn_dropout(attention_output)
+        node_update = self.node_attn_norm(node_update)
+        if self.residual:
+            node_update = node_update + self.node_ffn_dropout(
+                self.node_ffn(node_update)
+            )
+        else:
+            node_update = self.node_ffn_dropout(self.node_ffn(node_update))
+        node_update = self.node_ffn_norm(node_update)
+        return node_update, edge_output
+
+
 class AttentiveGraphReadout(nn.Module):
     """Normalize node attention independently inside each compact graph."""
 
@@ -436,14 +562,14 @@ class AttentiveGraphReadout(nn.Module):
 
 
 class GraphEncoder(nn.Module):
-    """Encode a compact PyG molecular batch with GatedGCN or GINE."""
+    """Encode a compact PyG molecular batch with GatedGCN, GINE, or GROVER."""
 
-    SUPPORTED_ENCODERS = frozenset({"gatedgcn", "gine"})
+    SUPPORTED_ENCODERS = frozenset({"gatedgcn", "gine", "grover"})
 
     def __init__(
         self,
         *,
-        encoder_type: str = "gatedgcn",
+        encoder_type: str = "grover",
         node_feature_cardinalities: Sequence[
             int
         ] = MASKED_OGB_ATOM_FEATURE_CARDINALITIES,
@@ -452,6 +578,7 @@ class GraphEncoder(nn.Module):
         ] = MASKED_OGB_BOND_FEATURE_CARDINALITIES,
         hidden_size: int = 512,
         num_layers: int = 5,
+        num_heads: int = 8,
         dropout: float = 0.1,
         residual: bool = True,
         layer_norm: bool = True,
@@ -462,11 +589,6 @@ class GraphEncoder(nn.Module):
         if not isinstance(encoder_type, str) or not encoder_type.strip():
             raise ValueError("encoder_type must be a non-empty string")
         normalized_type = encoder_type.strip().lower()
-        if normalized_type == "grover":
-            raise ValueError(
-                "this encoder supports only gatedgcn and gine; GROVER is a "
-                "distinct pretrained architecture and is never treated as an alias"
-            )
         if normalized_type == "gin":
             raise ValueError(
                 "plain GIN ignores required bond features; use encoder_type='gine'"
@@ -480,6 +602,12 @@ class GraphEncoder(nn.Module):
         self.encoder_type = normalized_type
         self.hidden_size = _positive_integer(hidden_size, "hidden_size")
         layer_count = _positive_integer(num_layers, "num_layers")
+        head_count = _positive_integer(num_heads, "num_heads")
+        if normalized_type == "grover" and self.hidden_size % head_count != 0:
+            raise ValueError(
+                f"hidden_size ({self.hidden_size}) must be divisible by "
+                f"num_heads ({head_count}) for encoder_type='grover'"
+            )
         dropout_probability = _dropout_probability(dropout)
         use_residual = _require_boolean(residual, "residual")
         use_layer_norm = _require_boolean(layer_norm, "layer_norm")
@@ -519,6 +647,17 @@ class GraphEncoder(nn.Module):
             self.layers = nn.ModuleList(
                 GatedGCNLayer(
                     self.hidden_size,
+                    dropout=dropout_probability,
+                    residual=use_residual,
+                    layer_norm=use_layer_norm,
+                )
+                for _ in range(layer_count)
+            )
+        elif self.encoder_type == "grover":
+            self.layers = nn.ModuleList(
+                GroverLayer(
+                    self.hidden_size,
+                    num_heads=head_count,
                     dropout=dropout_probability,
                     residual=use_residual,
                     layer_norm=use_layer_norm,
