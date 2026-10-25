@@ -45,103 +45,80 @@ python scripts/preprocess/prepare_pcqm_manifest.py \
   --dataset-root data/raw/PCQM4Mv2 \
   --output data/processed/pcqm/source_manifest.parquet
 
-cd ~/autodl-tmp/SemMol/data/raw/PCQM4Mv2
-
-wget -c \
-  http://ogb-data.stanford.edu/data/lsc/pcqm4m-v2-train.sdf.tar.gz
-
-echo "fd72bce606e7ddf36c2a832badeec6ab  pcqm4m-v2-train.sdf.tar.gz" \
-  | md5sum -c -
-tar -xf pcqm4m-v2-train.sdf.tar.gz
-test -s pcqm4m-v2-train.sdf &&
-  echo "PCQM4Mv2 official 3D SDF: OK"
-```
-
-2. Filter 1M/3M selections:
-
-```bash
 python scripts/preprocess/filter_pcqm.py \
   --source-manifest data/processed/pcqm/source_manifest.parquet \
   --output-dir data/processed/pcqm/manifests \
   --target-sizes 1000000 3000000 \
   --smiles-col smiles --gap-col homolumogap \
   --source-index-col source_index --official-split-col official_split \
-  --selection-mode approximate
+  --selection-mode exact
 ```
 
-3. Train ESPF vocabulary from the selection:
+Selection is scaffold-aware, diversity-ranked, and gap-stratified. Exact max-min ranking is expensive at large scale; use frozen released source indices when reproducing an existing experiment. The explicit `approximate` mode is an engineering variant, not an unqualified claim of global exact FPS. Selection manifests record the algorithm, seed and scope. HOMO-LUMO gap is used for subset construction, not as a pretraining target.
+
+Train one frozen ESPF vocabulary from the selected pretraining pool and use it for every downstream dataset:
 
 ```bash
 python scripts/preprocess/build_espf_vocab.py \
   --input <selection_manifest.parquet> \
-  --output-dir data/processed/pcqm/tokenizer \
-  --smiles-col canonical_smiles
-```
+  --output-dir data/processed/pcqm/tokenizer --smiles-col canonical_smiles
 
-4. Generate 3D conformer shards:
-
-```bash
 python scripts/preprocess/generate_3d_conformer.py \
   --input data/processed/pcqm/source_manifest.parquet \
-  --manifest <selection_manifest.parquet> \
-  --source-index-col source_index \
-  --output-dir data/processed/pcqm/geometry
-```
-
-Without `--official-sdf`, this command uses the deterministic ETKDGv2/MMFF path. The source manifest already exports `train_ordinal`; if you have the SDF locally, replace the above with:
-
-```bash
-python scripts/preprocess/generate_3d_conformer.py \
-  --input data/processed/pcqm/source_manifest.parquet \
-  --manifest <selection_manifest.parquet> \
-  --source-index-col source_index --sdf-ordinal-col train_ordinal \
+  --manifest <selection_manifest.parquet> --source-index-col source_index \
+  --sdf-ordinal-col train_ordinal \
   --official-sdf data/raw/PCQM4Mv2/pcqm4m-v2-train.sdf \
-  --output-dir data/processed/pcqm/geometry
-```
+  --output-dir data/processed/pcqm/geometry --num-conformers 1
 
-5. Build the pretraining store:
-
-```bash
 python scripts/preprocess/build_pcqm_store.py \
   --selection-manifest data/processed/pcqm/manifests/pcqm_selection_CURRENT.json \
   --geometry-dir data/processed/pcqm/geometry \
   --tokenizer-dir data/processed/pcqm/tokenizer \
-  --output-dir data/processed/pcqm/store \
-  --target-sizes 1000000,3000000
-```
+  --output-dir data/processed/pcqm/store --target-sizes 1000000,3000000
 
-6. Validate the store:
-
-```bash
 python scripts/preprocess/validate_processed_store.py \
   --store-dir data/processed/pcqm/store --full
 ```
 
-`generate_qm_density.py` is an optional step for independent NPZ generation. It is not part of the formal pretraining objective, nor is it a required input consumer for the final store. However, the current PCQM and MoleculeNet store builders still unconditionally compute and store promolecular density, which adds to preprocessing compute and storage overhead.
+The official-geometry path is the default. A missing/failed official source does not silently become ETKDG: fallback must be requested with `--allow-etkdg-fallback`. For an explicit generated-geometry ablation use `--geometry-source etkdg`. These options generate atomic conformers, not electron densities. Geometry manifests retain source and failure information.
 
-### MoleculeNet: Downstream Data
 
-Place the raw CSV files for the nine registered datasets under `<moleculenet_raw_root>`. The filenames and required label columns are determined by the dataset registry; the repository cannot uniquely infer your raw data layout from the README. Then build splits, then the store, then validate:
+Without `--official-sdf`, this command uses the deterministic ETKDGv2/MMFF path. The source manifest already exports `train_ordinal`; if you have the SDF locally, replace the above with:
+## Eight-GPU pretraining
+
+The two production pretraining configurations retain eight processes and use ten epochs:
 
 ```bash
-python scripts/preprocess/build_scaffold_splits.py \
-  --raw-root <moleculenet_raw_root> \
-  --output-dir data/splits \
-  --datasets bace bbbp clintox tox21 toxcast sider freesolv esol lipophilicity \
-  --frac 0.8 0.1 0.1
-
-python scripts/preprocess/build_moleculenet_store.py \
-  --raw-root <moleculenet_raw_root> \
-  --split-root data/splits \
-  --tokenizer-dir data/processed/pcqm/tokenizer \
-  --output-root data/processed/moleculenet \
-  --datasets bace bbbp clintox tox21 toxcast sider freesolv esol lipophilicity
-
-for dataset in bace bbbp clintox tox21 toxcast sider freesolv esol lipophilicity; do
-  python scripts/preprocess/validate_processed_store.py \
-    --store-dir "data/processed/moleculenet/${dataset}" --full
-done
+bash scripts/pretrain/run_pretrain.sh configs/pretrain/pretrain_1m.yaml
+bash scripts/pretrain/run_pretrain.sh configs/pretrain/pretrain_3m.yaml
 ```
+
+`world_size` is the total GPU/process count. For multiple nodes set `NNODES`, `NODE_RANK`, `MASTER_ADDR` and `NPROC_PER_NODE` consistently. Do not pass a fixed `--device cuda:0` under torchrun. `train.batch_size` is per rank; the effective batch also depends on world size and accumulation. Actual wall time is measured, not copied from the manuscript.
+
+The runner resolves the same ACSM temperature and epsilon for matching and loss, writes complete runtime configuration, and saves architecture/anchor identity with checkpoints. Without a validation loader, use the produced `*_latest.pt`, not a nonexistent `*_best.pt`.
+
+## Downstream supervised fitting and anchor variants
+
+```bash
+bash scripts/finetune/run_finetune.sh configs/finetune/bace.yaml
+bash scripts/finetune/run_finetune.sh configs/finetune/bace_anchor_2d.yaml
+bash scripts/finetune/run_finetune.sh configs/finetune/bace_anchor_3d.yaml
+```
+
+All supplied pretraining and downstream configurations use eight GPUs, including the small/debug pretraining presets. Downstream names without a suffix, such as `configs/finetune/bace.yaml`, already select eight GPUs; `_8gpu.yaml` names remain compatible alternatives with separate experiment names. Batch size is per rank, and the effective batch includes all eight ranks and accumulation steps. CPU integration tests override this explicitly with one process.
+
+Each benchmark runs ten distinct supervised seeds. The model/anchor, input modality and pretrained center-library keys must match. Pretrain configurations for 2D/3D anchors are supplied under `configs/pretrain/`. Validation selects the checkpoint; test is evaluated after selection and does not update centers. Ten training seeds are not ten CV folds.
+
+For SemMol without external pretraining, run train-only semantic alignment followed by supervised fitting:
+
+```bash
+python scripts/finetune/run_two_stage.py configs/finetune/bace.yaml \
+  --output-dir outputs/two_stage/bace --prepare-only
+# Inspect the generated protocol/configs, then omit --prepare-only to execute.
+```
+
+Both stages default to eight GPUs. This protocol performs one explicitly seeded alignment initialization on the registered outer training view, followed by ten independently seeded supervised fits. It does not describe the entire two-stage process as ten independent pretraining runs. No validation/test samples enter alignment or DCL updates.
+
 ## 📦 Data Availability & Pre-trained Model Checkpoints
 
 To ensure the full reproducibility of our study, we provide public access to all pre-training dataset index files, data split files, and pre-trained model weights (checkpoints).
