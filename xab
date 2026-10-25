@@ -1,0 +1,862 @@
+                expected_sha256=static.artifact_fingerprints[
+                    f"{split}_manifest"
+                ],
+            )
+
+        train = split_datasets["train"]
+        valid = split_datasets["valid"]
+        test = split_datasets["test"]
+        label_columns = train.label_columns
+        if valid.label_columns != label_columns or test.label_columns != label_columns:
+            raise ValueError("train/valid/test label columns must match exactly")
+        if len(label_columns) != options.num_tasks:
+            raise ValueError("dataset label columns differ from task.num_tasks")
+        if not static.spec.dynamic_label_columns and (
+            label_columns != static.spec.label_columns
+        ):
+            raise ValueError("dataset label columns differ from the registry")
+        if any(
+            dataset.build_manifest != train.build_manifest
+            for dataset in (valid, test)
+        ):
+            raise ValueError("all fixed splits must use the same build manifest")
+
+        split_sizes = {
+            split: len(dataset)
+            for split, dataset in split_datasets.items()
+        }
+        if any(size <= 0 for size in split_sizes.values()):
+            raise ValueError("train, validation, and test splits must be non-empty")
+        source_indices = {
+            split: set(int(value) for value in dataset.manifest.source_indices)
+            for split, dataset in split_datasets.items()
+        }
+        record_indices = {
+            split: set(int(value) for value in dataset.manifest.record_indices)
+            for split, dataset in split_datasets.items()
+        }
+        for left, right in (("train", "valid"), ("train", "test"), ("valid", "test")):
+            if source_indices[left] & source_indices[right]:
+                raise ValueError(
+                    f"fixed {left}/{right} splits overlap in source_index"
+                )
+            if record_indices[left] & record_indices[right]:
+                raise ValueError(
+                    f"fixed {left}/{right} splits overlap in record_index"
+                )
+        return _DatasetBundle(
+            train=train,
+            valid=valid,
+            test=test,
+            label_columns=label_columns,
+            split_sizes=split_sizes,
+        )
+    except BaseException:
+        for dataset in reversed(opened):
+            try:
+                dataset.close()
+            except BaseException:
+                continue
+        raise
+
+
+def _task_definition(
+    options: _RunOptions,
+    datasets: _DatasetBundle,
+) -> DownstreamTaskDefinition:
+    return DownstreamTaskDefinition(
+        task_type=options.task_type,
+        num_tasks=options.num_tasks,
+        task_names=datasets.label_columns,
+        main_metric=options.main_metric,
+        metric_direction=options.early_stopping_mode,
+    )
+
+
+class _ExperimentLogger:
+    def __init__(
+        self,
+        *,
+        writer: object | None,
+        wandb_run: object | None,
+    ) -> None:
+        self.writer = writer
+        self.wandb_run = wandb_run
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        options: _RunOptions,
+        configuration: Mapping[str, Any],
+    ) -> "_ExperimentLogger":
+        writer: object | None = None
+        wandb_run: object | None = None
+        experiment_log_dir = options.log_dir / options.experiment_name
+        experiment_log_dir.mkdir(parents=True, exist_ok=True)
+        if not experiment_log_dir.is_dir():
+            raise NotADirectoryError(
+                f"experiment log path is not a directory: {experiment_log_dir}"
+            )
+        try:
+            if options.tensorboard:
+                from torch.utils.tensorboard import SummaryWriter
+
+                writer = SummaryWriter(
+                    log_dir=str(experiment_log_dir / "tensorboard")
+                )
+            if options.wandb:
+                import wandb
+
+                wandb_dir = experiment_log_dir / "wandb"
+                wandb_dir.mkdir(parents=True, exist_ok=True)
+                wandb_run = wandb.init(
+                    project="SemMol",
+                    name=options.experiment_name,
+                    dir=str(wandb_dir),
+                    config=dict(configuration),
+                    reinit=True,
+                )
+                if wandb_run is None:
+                    raise RuntimeError("wandb.init returned no run")
+        except BaseException as primary_error:
+            cleanup_failures: list[BaseException] = []
+            if writer is not None:
+                try:
+                    close = getattr(writer, "close", None)
+                    if callable(close):
+                        close()
+                except BaseException as cleanup_error:
+                    cleanup_failures.append(cleanup_error)
+            if wandb_run is not None:
+                try:
+                    finish = getattr(wandb_run, "finish", None)
+                    if callable(finish):
+                        finish(exit_code=1)
+                except BaseException as cleanup_error:
+                    cleanup_failures.append(cleanup_error)
+            add_note = getattr(primary_error, "add_note", None)
+            if callable(add_note):
+                for cleanup_error in cleanup_failures:
+                    try:
+                        add_note(
+                            "logger initialization cleanup also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    except BaseException:
+                        continue
+            raise
+        return cls(writer=writer, wandb_run=wandb_run)
+
+    @staticmethod
+    def _epoch_metrics(
+        seed: int,
+        result: FinetuningEpochResult,
+    ) -> dict[str, float | int]:
+        metrics: dict[str, float | int] = {
+            "seed": seed,
+            "epoch": result.epoch + 1,
+            "train/loss": result.train_loss,
+            "validation/loss": result.validation.loss,
+            "validation/main_metric": result.validation.main_metric,
+            "train/optimizer_steps": result.optimizer_steps,
+            "early_stopping/bad_epochs": result.bad_epochs,
+            "early_stopping/improved": int(result.improved),
+        }
+        for index, learning_rate in enumerate(result.learning_rates):
+            metrics[f"train/lr_group_{index}"] = learning_rate
+        return metrics
+
+    def log_epoch(
+        self,
+        *,
+        seed: int,
+        seed_index: int,
+        max_epochs: int,
+        log_interval: int,
+        result: FinetuningEpochResult,
+    ) -> None:
+        metrics = self._epoch_metrics(seed, result)
+        epoch = result.epoch + 1
+        global_step = seed_index * max_epochs + epoch
+        if self.writer is not None:
+            add_scalar = getattr(self.writer, "add_scalar", None)
+            if not callable(add_scalar):
+                raise TypeError("TensorBoard writer does not provide add_scalar")
+            prefix = f"seed_{seed}"
+            for name, value in metrics.items():
+                if name not in {"seed", "epoch"}:
+                    add_scalar(f"{prefix}/{name}", value, global_step=epoch)
+        if self.wandb_run is not None:
+            log = getattr(self.wandb_run, "log", None)
+            if not callable(log):
+                raise TypeError("Weights & Biases run does not provide log")
+            log(metrics, step=global_step)
+        if (
+            epoch == 1
+            or epoch % log_interval == 0
+            or epoch == max_epochs
+            or result.improved
+        ):
+            print(
+                json.dumps(
+                    {
+                        "event": "finetune_epoch",
+                        **metrics,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    def log_result(
+        self,
+        result: TenSeedBenchmarkResult,
+        *,
+        max_epochs: int,
+    ) -> None:
+        aggregate_metrics: dict[str, float | int] = {}
+        for aggregate in result.aggregates:
+            if aggregate.mean is not None:
+                aggregate_metrics[f"benchmark/{aggregate.name}_mean"] = (
+                    aggregate.mean
+                )
+            if aggregate.sample_standard_deviation is not None:
+                aggregate_metrics[
+                    f"benchmark/{aggregate.name}_sample_std"
+                ] = aggregate.sample_standard_deviation
+            aggregate_metrics[
+                f"benchmark/{aggregate.name}_eligible_seeds"
+            ] = aggregate.eligible_seed_count
+        step = len(result.runs) * max_epochs + 1
+        if self.writer is not None:
+            add_scalar = getattr(self.writer, "add_scalar", None)
+            if not callable(add_scalar):
+                raise TypeError("TensorBoard writer does not provide add_scalar")
+            for name, value in aggregate_metrics.items():
+                add_scalar(name, value, global_step=step)
+            flush = getattr(self.writer, "flush", None)
+            if callable(flush):
+                flush()
+        if self.wandb_run is not None:
+            log = getattr(self.wandb_run, "log", None)
+            if not callable(log):
+                raise TypeError("Weights & Biases run does not provide log")
+            log(aggregate_metrics, step=step)
+
+    def close(self, *, success: bool) -> None:
+        failures: list[BaseException] = []
+        if self.writer is not None:
+            try:
+                flush = getattr(self.writer, "flush", None)
+                if callable(flush):
+                    flush()
+                close = getattr(self.writer, "close", None)
+                if not callable(close):
+                    raise TypeError("TensorBoard writer does not provide close")
+                close()
+            except BaseException as exc:
+                failures.append(exc)
+        if self.wandb_run is not None:
+            try:
+                finish = getattr(self.wandb_run, "finish", None)
+                if not callable(finish):
+                    raise TypeError("Weights & Biases run does not provide finish")
+                finish(exit_code=0 if success else 1)
+            except BaseException as exc:
+                failures.append(exc)
+        if failures:
+            raise failures[0]
+
+
+def _initialize_logger(
+    context: DistributedContext,
+    *,
+    options: _RunOptions,
+    configuration: Mapping[str, Any],
+) -> _ExperimentLogger:
+    logger = _rank_zero_stage(
+        context,
+        "finetuning logger initialization",
+        lambda: _ExperimentLogger.create(
+            options=options,
+            configuration=configuration,
+        ),
+    )
+    if context.is_main_process:
+        if not isinstance(logger, _ExperimentLogger):
+            raise RuntimeError("rank zero did not create the finetuning logger")
+        return logger
+    return _ExperimentLogger(writer=None, wandb_run=None)
+
+
+def _close_logger(
+    context: DistributedContext,
+    logger: _ExperimentLogger | None,
+    *,
+    success: bool,
+) -> None:
+    _rank_zero_stage(
+        context,
+        "finetuning logger close",
+        lambda: None if logger is None else logger.close(success=success),
+    )
+
+
+class _SeedEpochCallback:
+    """Same callable type on every rank; only rank zero performs I/O."""
+
+    def __init__(
+        self,
+        *,
+        context: DistributedContext,
+        logger: _ExperimentLogger,
+        seed: int,
+        seed_index: int,
+        max_epochs: int,
+        log_interval: int,
+    ) -> None:
+        self.context = context
+        self.logger = logger
+        self.seed = seed
+        self.seed_index = seed_index
+        self.max_epochs = max_epochs
+        self.log_interval = log_interval
+
+    def __call__(self, result: FinetuningEpochResult) -> None:
+        if not self.context.is_main_process:
+            return
+        self.logger.log_epoch(
+            seed=self.seed,
+            seed_index=self.seed_index,
+            max_epochs=self.max_epochs,
+            log_interval=self.log_interval,
+            result=result,
+        )
+
+
+class _SeededFinetuningCollator(FinetuningDataCollator):
+    """Attach the run seed to an otherwise deterministic finetuning collator."""
+
+    def __init__(
+        self,
+        *,
+        pad_token_id: int,
+        allow_partial_modalities: bool,
+        seed: int,
+    ) -> None:
+        super().__init__(
+            pad_token_id=pad_token_id,
+            allow_partial_modalities=allow_partial_modalities,
+        )
+        self.seed = require_int(
+            "collator seed",
+            seed,
+            minimum=0,
+            maximum=_MAX_SEED,
+        )
+
+
+class _PreparedRunFactory:
+    """Purely rank-local factory; the benchmark runner owns every collective."""
+
+    def __init__(
+        self,
+        *,
+        configuration: LoadedExperimentConfiguration,
+        options: _RunOptions,
+        context: DistributedContext,
+        static: _StaticInputs,
+        datasets: _DatasetBundle,
+        task: DownstreamTaskDefinition,
+        logger: _ExperimentLogger,
+    ) -> None:
+        self.configuration = configuration
+        self.options = options
+        self.context = context
+        self.static = static
+        self.datasets = datasets
+        self.task = task
+        self.logger = logger
+        self.seed_indices = {
+            seed: index for index, seed in enumerate(options.seeds)
+        }
+
+    def _collator(self, seed: int) -> _SeededFinetuningCollator:
+        return _SeededFinetuningCollator(
+            pad_token_id=self.static.tokenizer.pad_token_id,
+            allow_partial_modalities=not self.options.strict_modalities,
+            seed=seed,
+        )
+
+    def _loader(
+        self,
+        dataset: MoleculeNetDataset,
+        *,
+        collator: _SeededFinetuningCollator,
+        shuffle: bool,
+        seed: int,
+    ) -> Any:
+        return create_dataloader(
+            dataset,
+            batch_size=self.options.batch_size,
+            collate_fn=collator,
+            shuffle=shuffle,
+            num_workers=self.options.num_workers,
+            pin_memory=self.options.pin_memory,
+            drop_last=False,
+            persistent_workers=self.options.persistent_workers,
+            prefetch_factor=self.options.prefetch_factor,
+            seed=seed,
+        )
+
+    def __call__(self, seed: int) -> PreparedFinetuningRun:
+        if seed not in self.seed_indices:
+            raise ValueError(f"runner requested an undeclared seed: {seed}")
+
+        expected_checkpoint_sha256 = self.static.artifact_fingerprints[
+            "pretrained_checkpoint"
+        ]
+        checkpoint_sha256_before = sha256_file(
+            self.options.pretrained_checkpoint
+        )
+        if checkpoint_sha256_before != expected_checkpoint_sha256:
+            raise RuntimeError(
+                "pretrained checkpoint changed after startup validation"
+            )
+        model = self.static.resolved_model.build()
+        transfer = load_pretrained_semmol(
+            self.options.pretrained_checkpoint,
+            model,
+            map_location=torch.device("cpu"),
+        )
+        checkpoint_sha256_after = sha256_file(
+            self.options.pretrained_checkpoint
+        )
+        if checkpoint_sha256_after != expected_checkpoint_sha256:
+            raise RuntimeError(
+                "pretrained checkpoint changed while preparing a seed"
+            )
+        if transfer.path != self.options.pretrained_checkpoint:
+            raise ValueError("pretrained transfer resolved an unexpected path")
+        if not transfer.missing_keys or any(
+            not name.startswith("property_head.")
+            for name in transfer.missing_keys
+        ):
+            raise RuntimeError(
+                "pretrained transfer must leave only the fresh property head "
+                "uninitialized"
+            )
+        model_values = tuple(model.parameters()) + tuple(model.buffers())
+        if any(value.device.type != "cpu" for value in model_values):
+            raise ValueError("Prepared model must remain on CPU before runner setup")
+
+        train_collator = self._collator(seed)
+        valid_collator = self._collator(seed)
+        test_collator = self._collator(seed)
+        train_loader = self._loader(
+            self.datasets.train,
+            collator=train_collator,
+            shuffle=True,
+            seed=seed,
+        )
+        valid_loader = self._loader(
+            self.datasets.valid,
+            collator=valid_collator,
+            shuffle=False,
+            seed=seed,
+        )
+        test_loader = self._loader(
+            self.datasets.test,
+            collator=test_collator,
+            shuffle=False,
+            seed=seed,
+        )
+        loader_batch_counts = {
+            "train": len(train_loader),
+            "valid": len(valid_loader),
+            "test": len(test_loader),
+        }
+        if any(count <= 0 for count in loader_batch_counts.values()):
+            raise ValueError("every finetuning DataLoader must contain a batch")
+        steps_per_epoch = optimizer_steps_per_epoch(
+            loader_batch_counts["train"],
+            self.options.accumulation_steps,
+        )
+        total_optimizer_steps = steps_per_epoch * self.options.epochs
+        if total_optimizer_steps <= 0 or not math.isfinite(
+            float(total_optimizer_steps)
+        ):
+            raise ValueError("total optimizer steps must be positive and finite")
+
+        seed_directory = (
+            self.options.checkpoint_dir
+            / self.options.experiment_name
+            / f"seed_{seed}"
+        )
+        trainer_config = FinetuningTrainerConfig(
+            max_epochs=self.options.epochs,
+            best_checkpoint_path=seed_directory / "best.pt",
+            latest_checkpoint_path=seed_directory / "latest.pt",
+            gradient_accumulation_steps=self.options.accumulation_steps,
+            precision=self.options.precision,
+            gradient_clip_norm=self.options.gradient_clip_norm,
+            early_stopping_patience=(
+                self.options.early_stopping_patience
+                if self.options.early_stopping_enabled
+                else None
+            ),
+            min_improvement=0.0,
+            non_blocking_transfer=(
+                self.options.pin_memory and self.context.device.type == "cuda"
+            ),
+        )
+        sampler_sizes = {
+            "train": len(train_loader.sampler),
+            "valid": len(valid_loader.sampler),
+            "test": len(test_loader.sampler),
+        }
+        config_fingerprint = training_configuration_fingerprint(
+            self.configuration.values,
+            resolved_model_configuration=(
+                self.static.resolved_model.model_options
+            ),
+            artifact_fingerprints=self.static.artifact_fingerprints,
+            derived_values={
+                "seed": seed,
+                "train_loader_batch_count": loader_batch_counts["train"],
+                "valid_loader_batch_count": loader_batch_counts["valid"],
+                "test_loader_batch_count": loader_batch_counts["test"],
+                "optimizer_steps_per_epoch": steps_per_epoch,
+                "total_optimizer_steps": total_optimizer_steps,
+                "world_size": self.context.world_size,
+                "train_split_size": self.datasets.split_sizes["train"],
+                "valid_split_size": self.datasets.split_sizes["valid"],
+                "test_split_size": self.datasets.split_sizes["test"],
+                "train_sampler_size": sampler_sizes["train"],
+                "valid_sampler_size": sampler_sizes["valid"],
+                "test_sampler_size": sampler_sizes["test"],
+                "gradient_accumulation_steps": (
+                    self.options.accumulation_steps
+                ),
+                "max_epochs": self.options.epochs,
+                "label_columns": self.datasets.label_columns,
+                "loss_type": (
+                    "binary_cross_entropy_with_logits"
+                    if self.options.task_type == "classification"
+                    else "mse"
+                ),
+                "deterministic": _DETERMINISTIC,
+                "cudnn_benchmark": _CUDNN_BENCHMARK,
+                "find_unused_parameters": self.options.distributed[
+                    "find_unused_parameters"
+                ],
+            },
+        )
+        callback = _SeedEpochCallback(
+            context=self.context,
+            logger=self.logger,
+            seed=seed,
+            seed_index=self.seed_indices[seed],
+            max_epochs=self.options.epochs,
+            log_interval=self.options.log_interval,
+        )
+        return PreparedFinetuningRun(
+            seed=seed,
+            model=model,
+            loss_fn=DownstreamTaskLoss(
+                task_type=self.options.task_type,
+                loss_type="mse",
+                distributed_sync=self.context.distributed,
+                validate_values=True,
+            ),
+            train_loader=train_loader,
+            valid_loader=valid_loader,
+            test_loader=test_loader,
+            config=trainer_config,
+            config_fingerprint=config_fingerprint,
+            optimizer_options=self.options.optimizer,
+            scheduler_options=self.options.scheduler,
+            distributed_options={
+                "broadcast_buffers": False,
+                "sync_batchnorm": self.options.distributed["sync_batchnorm"],
+                "find_unused_parameters": self.options.distributed[
+                    "find_unused_parameters"
+                ],
+            },
+            epoch_callback=callback,
+        )
+
+
+def _cleanup_runtime(context: DistributedContext) -> None:
+    gc.collect()
+    if context.device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def _report_cleanup_failures(failures: Sequence[BaseException]) -> None:
+    if not failures:
+        return
+    try:
+        descriptions: list[str] = []
+        for error in failures:
+            try:
+                detail = str(error)
+            except BaseException:
+                detail = "<unprintable exception>"
+            descriptions.append(f"{type(error).__name__}: {detail}")
+        print(
+            "cleanup errors after finetuning failure: "
+            + "; ".join(descriptions),
+            file=sys.stderr,
+            flush=True,
+        )
+    except BaseException:
+        return
+
+
+def _destroy_failed_process_group(context: DistributedContext) -> None:
+    """Destroy this entry point's group without waiting on failed peers."""
+
+    if (
+        not context.initialized_here
+        or not dist.is_available()
+        or not dist.is_initialized()
+    ):
+        return
+    if dist.get_rank() != context.rank or dist.get_world_size() != (
+        context.world_size
+    ):
+        raise RuntimeError("refusing to destroy a different process group")
+    dist.destroy_process_group()
+
+
+def _run(arguments: argparse.Namespace) -> int:
+    configuration = load_experiment_configuration(
+        arguments.config,
+        expected_mode="finetune",
+    )
+    bootstrap_distributed = configuration.section("distributed")
+
+    context: DistributedContext | None = None
+    datasets: _DatasetBundle | None = None
+    logger: _ExperimentLogger | None = None
+    primary_error: BaseException | None = None
+    cleanup_failures: list[BaseException] = []
+    completed = False
+    try:
+        context = initialize_distributed(
+            bootstrap_distributed,
+            requested_device=arguments.device,
+        )
+        options = _synchronized_local_stage(
+            context,
+            "strict finetuning configuration validation",
+            lambda: _parse_configuration(configuration),
+        )
+        raw_configuration_sha256 = _synchronized_local_stage(
+            context,
+            "finetuning configuration canonicalization",
+            lambda: configuration_fingerprint(configuration.values),
+        )
+        _require_matching_signature(
+            context,
+            "finetuning configuration contract",
+            {
+                "configuration_sha256": raw_configuration_sha256,
+                "experiment": options.experiment_name,
+                "experiment_seed": options.experiment_seed,
+                "seeds": options.seeds,
+                "world_size": options.distributed["world_size"],
+                "find_unused_parameters": options.distributed[
+                    "find_unused_parameters"
+                ],
+                "deterministic": _DETERMINISTIC,
+                "cudnn_benchmark": _CUDNN_BENCHMARK,
+            },
+        )
+        static = _synchronized_local_stage(
+            context,
+            "tokenizer, model, checkpoint, and artifact validation",
+            lambda: _load_static_inputs(configuration, options),
+        )
+        _require_matching_signature(
+            context,
+            "static finetuning input contract",
+            {
+                "dataset": static.spec.name,
+                "task_type": static.spec.task_type,
+                "num_tasks": static.spec.num_tasks,
+                "main_metric": static.spec.main_metric,
+                "tokenizer_sha256": static.tokenizer_sha256,
+                "resolved_model_sha256": static.resolved_model_sha256,
+                "artifact_fingerprints": tuple(
+                    sorted(static.artifact_fingerprints.items())
+                ),
+            },
+        )
+
+        datasets = _synchronized_local_stage(
+            context,
+            "fixed MoleculeNet split construction and validation",
+            lambda: _build_datasets(options, static),
+        )
+        _require_matching_signature(
+            context,
+            "fixed MoleculeNet split contract",
+            {
+                "label_columns": datasets.label_columns,
+                "split_sizes": tuple(sorted(datasets.split_sizes.items())),
+                "modalities": options.data_modalities,
+                "strict_modalities": options.strict_modalities,
+            },
+        )
+        task = _synchronized_local_stage(
+            context,
+            "downstream task definition",
+            lambda: _task_definition(options, datasets),
+        )
+        _require_matching_signature(
+            context,
+            "downstream task definition",
+            task.as_dict(),
+        )
+
+        logger = _initialize_logger(
+            context,
+            options=options,
+            configuration=configuration.values,
+        )
+        prepared_factory = _synchronized_local_stage(
+            context,
+            "prepared-run factory construction",
+            lambda: _PreparedRunFactory(
+                configuration=configuration,
+                options=options,
+                context=context,
+                static=static,
+                datasets=datasets,
+                task=task,
+                logger=logger,
+            ),
+        )
+        runner = TenSeedFinetuningRunner(
+            context=context,
+            task=task,
+            seeds=options.seeds,
+            prepared_run_factory=prepared_factory,
+            deterministic=_DETERMINISTIC,
+            cudnn_benchmark=_CUDNN_BENCHMARK,
+        )
+        result = runner.run()
+        _rank_zero_stage(
+            context,
+            "final benchmark logging",
+            lambda: logger.log_result(result, max_epochs=options.epochs),
+        )
+        result_path = (
+            options.log_dir
+            / options.experiment_name
+            / "ten_seed_results.json"
+        )
+
+        def publish_result() -> None:
+            atomic_write_json(
+                result_path,
+                result.as_dict(),
+                overwrite=True,
+            )
+            print(
+                json.dumps(
+                    {
+                        "event": "ten_seed_benchmark_complete",
+                        "experiment": options.experiment_name,
+                        "path": str(result_path),
+                        "seeds": list(options.seeds),
+                        "world_size": context.world_size,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+        _rank_zero_stage(
+            context,
+            "atomic ten-seed result publication",
+            publish_result,
+        )
+        completed = True
+        return 0
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if primary_error is None:
+            if context is not None:
+                try:
+                    _close_logger(context, logger, success=completed)
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+            if context is not None and datasets is not None:
+                try:
+                    _synchronized_local_stage(
+                        context,
+                        "MoleculeNet dataset cleanup",
+                        datasets.close,
+                    )
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+            if context is not None:
+                try:
+                    _synchronized_local_stage(
+                        context,
+                        "finetuning runtime cleanup",
+                        lambda: _cleanup_runtime(context),
+                    )
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+                try:
+                    context.close()
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+            if cleanup_failures:
+                raise cleanup_failures[0]
+        else:
+            if (
+                context is not None
+                and context.is_main_process
+                and logger is not None
+            ):
+                try:
+                    logger.close(success=False)
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+            if datasets is not None:
+                try:
+                    datasets.close()
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+            if context is not None:
+                try:
+                    _cleanup_runtime(context)
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+                try:
+                    _destroy_failed_process_group(context)
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+            if cleanup_failures and (
+                context is None or context.is_main_process
+            ):
+                _report_cleanup_failures(cleanup_failures)
+
+
+def main() -> int:
+    arguments = _argument_parser().parse_args()
+    return _run(arguments)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
