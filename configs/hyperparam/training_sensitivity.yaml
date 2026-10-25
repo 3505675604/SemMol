@@ -1,0 +1,42 @@
+
+name: "Training Parameter Sensitivity"
+description: >
+  Sensitivity analysis of learning rate, weight decay, and loss weights.
+  Loss weights are expected to have minimal impact since the contrastive
+  loss is the primary performance driver.
+
+search_strategy: grid
+
+axes:
+  - path: "train.optimizer.lr"
+    values: [1.0e-5, 5.0e-5, 1.0e-4, 3.0e-4, 5.0e-4]
+    value_type: float
+
+  - path: "train.optimizer.weight_decay"
+    values: [0.0, 0.01, 0.05, 0.1]
+    value_type: float
+
+  - path: "loss.mlm"
+    values: [0.5, 1.0]
+    value_type: float
+
+  - path: "loss.graph"
+    values: [0.5, 1.0]
+    value_type: float
+
+  - path: "loss.geo"
+    values: [0.1, 0.5, 1.0]
+    value_type: float
+
+constraints:
+  - expression: "loss.mlm >= 0"
+    message: "mlm loss weight must be non-negative"
+
+evaluation:
+  mode: pretrain
+  fast_epochs: 10
+  metrics: ["train_loss"]
+  direction: minimize
+
+seed: 3407
+max_trials: 120

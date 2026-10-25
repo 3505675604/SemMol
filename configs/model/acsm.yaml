@@ -1,0 +1,14 @@
+feature_dim: 256
+num_retrieve: 16
+temperature: 0.07
+learnable_temperature: false
+weighting: softmax
+
+denoise_threshold: 0.5
+negative_selection: hard
+# Eq. (9) retains every eligible non-positive center. Set an integer only
+# for an explicitly labelled capped-negative variant.
+max_negatives: null
+
+eps: 1.0e-8
+validate_values: false

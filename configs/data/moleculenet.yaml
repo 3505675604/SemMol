@@ -1,0 +1,63 @@
+schema_version: 1
+
+datasets:
+  - bace
+  - bbbp
+  - clintox
+  - tox21
+  - toxcast
+  - sider
+  - freesolv
+  - esol
+  - lipophilicity
+
+source:
+  raw_root: data/raw/MoleculeNet
+  processed_root: data/processed/moleculenet
+  split_root: data/splits
+
+split:
+  method: bemis_murcko
+  scaffold_definition: bemis_murcko
+  allocation_strategy: random_groups
+  fractions: [0.8, 0.1, 0.1]
+  seed: 42
+  include_chirality: false
+  invalid_smiles_policy: report
+  output_format: json
+  dp_state_limit: 250000
+
+tokenizer:
+  directory: data/processed/pcqm/tokenizer
+  max_length: 256
+
+geometry:
+  num_conformers: 1
+  multi_conformer_count: 4
+  post_optimization_diversity: true
+  prune_rms_threshold: 0.5
+  seed: 42
+
+external_qm:
+  enabled: false
+  directory: null
+  required_when_enabled: true
+  schema: semmol.external_qm_density.v1
+
+storage:
+  records_per_shard: 4096
+  lmdb_map_size_gib: 2
+  compression_level: 3
+  commit_interval: 256
+
+builder:
+  workers: 8
+  work_batch_size: 512
+  verify_checksums: true
+
+loader:
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  strict_modalities: true

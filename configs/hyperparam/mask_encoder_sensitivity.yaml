@@ -1,0 +1,42 @@
+name: "Mask and Encoder Sensitivity"
+description: >
+  Sensitivity analysis of mask ratios, geo noise, and encoder dropout.
+  These parameters are expected to have moderate sensitivity.
+
+search_strategy: grid
+
+axes:
+  - path: "mask.smiles_ratio"
+    values: [0.10, 0.15, 0.20, 0.25]
+    value_type: float
+
+  - path: "mask.node_ratio"
+    values: [0.10, 0.15, 0.20, 0.25]
+    value_type: float
+
+  - path: "mask.edge_ratio"
+    values: [0.10, 0.15, 0.20, 0.25]
+    value_type: float
+
+  - path: "mask.geo_noise_std"
+    values: [0.5, 1.0, 1.5, 2.0]
+    value_type: float
+
+  - path: "model.encoders.graph.dropout"
+    values: [0.0, 0.1, 0.2, 0.3]
+    value_type: float
+
+  - path: "model.encoders.geo.dropout"
+    values: [0.0, 0.1, 0.2, 0.3]
+    value_type: float
+
+constraints: []
+
+evaluation:
+  mode: pretrain
+  fast_epochs: 10
+  metrics: ["train_loss"]
+  direction: minimize
+
+seed: 3407
+max_trials: 100

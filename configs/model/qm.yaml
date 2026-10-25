@@ -1,0 +1,36 @@
+# Optional external QM input contract. SemMol never generates electron density.
+# Point preprocessing --external-density-dir at an existing external artifact root.
+external_input:
+  schema: semmol.external_qm_density.v1
+  path_pattern: "<root>/<dataset-or-pcqm>/<source_index>.npz"
+  grid_shape: [1, 32, 32, 32]
+  dtype: float32
+  spacing: 0.75
+  length_unit: angstrom
+  units: electron/angstrom^3
+  density_kind: quantum_mechanical
+  required_provenance:
+    - calculation_method
+    - basis_set
+    - source_software
+    - source_uri
+    - charge
+    - spin_multiplicity
+    - electron_count
+    - integrated_electrons
+    - source_index
+    - canonical_smiles
+    - origin
+
+encoder:
+  in_channels: 1
+  grid_size: 32
+  voxel_spacing: 0.75
+  base_channels: 64
+  hidden_size: 512
+  num_res_blocks: 4
+  use_attention: true
+  dropout: 0.1
+  log1p_input: true
+  density_channel: 0
+  validate_values: false

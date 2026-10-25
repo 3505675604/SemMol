@@ -1,0 +1,27 @@
+name: "DCL Parameter Sensitivity"
+description: >
+  Sensitivity analysis of DCL num_clusters (K) and ema_momentum (β).
+  β is expected to be the most impactful parameter because it directly
+  controls the DCL memory-adaptation trade-off.
+
+search_strategy: grid
+
+axes:
+  - path: "model.dcl.num_clusters"
+    values: [32, 64, 128, 256, 512]
+    value_type: int
+
+  - path: "model.dcl.ema_momentum"
+    values: [0.5, 0.7, 0.9, 0.99, 0.999]
+    value_type: float
+
+constraints: []
+
+evaluation:
+  mode: pretrain
+  fast_epochs: 10
+  metrics: ["train_loss"]
+  direction: minimize
+
+seed: 3407
+max_trials: 50
